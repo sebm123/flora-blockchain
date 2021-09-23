@@ -22,16 +22,17 @@ from chia.util.byte_types import hexstr_to_bytes
 from chia.util.condition_tools import conditions_dict_for_solution, pkm_pairs_for_conditions_dict
 from chia.util.ints import uint8, uint32, uint64, uint128
 from chia.util.json_util import dict_to_json_str
+from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.block_record import HeaderBlockRecord
 from chia.wallet.cc_wallet.cc_info import CCInfo
 from chia.wallet.cc_wallet.cc_utils import (
     CC_MOD,
     SpendableCC,
-    cc_puzzle_for_inner_puzzle,
-    cc_puzzle_hash_for_inner_puzzle_hash,
+    construct_cc_puzzle,
     get_lineage_proof_from_coin_and_puz,
     spend_bundle_for_spendable_ccs,
-    uncurry_cc,
+    get_cat_truths,
+    match_cat_puzzle,
 )
 from chia.wallet.derivation_record import DerivationRecord
 from chia.wallet.puzzles.genesis_by_coin_id_with_0 import (
@@ -215,9 +216,7 @@ class CCWallet:
 
         amount: uint64 = uint64(0)
         for record in record_list:
-            lineage = await self.get_lineage_proof_for_coin(record.coin)
-            if lineage is not None:
-                amount = uint64(amount + record.coin.amount)
+            amount = uint64(amount + record.coin.amount)
 
         self.log.info(f"Confirmed balance for cc wallet {self.id()} is {amount}")
         return uint64(amount)
@@ -301,7 +300,7 @@ class CCWallet:
         search_for_parent: bool = True
 
         inner_puzzle = await self.inner_puzzle_for_cc_puzhash(coin.puzzle_hash)
-        lineage_proof = Program.to([coin.parent_coin_info, inner_puzzle.get_tree_hash(), coin.amount])
+        lineage_proof = LineageProof(coin.parent_coin_info, inner_puzzle.get_tree_hash(), coin.amount)
         await self.add_lineage(coin.name(), lineage_proof, True)
 
         for name, lineage_proofs in self.cc_info.lineage_proofs:
@@ -336,7 +335,7 @@ class CCWallet:
         coin_name = response.coin_name
         height = response.height
         puzzle: Program = response.puzzle
-        r = uncurry_cc(puzzle)
+        matched, curried_args = match_cat_puzzle(puzzle)
         header_hash = self.wallet_state_manager.blockchain.height_to_hash(height)
         block: Optional[
             HeaderBlockRecord
@@ -346,8 +345,8 @@ class CCWallet:
 
         removals = block.removals
 
-        if r is not None:
-            mod_hash, genesis_coin_checker_hash, inner_puzzle = r
+        if matched:
+            mod_hash, genesis_coin_checker_hash, inner_puzzle = curried_args
             self.log.info(f"parent: {coin_name} inner_puzzle for parent is {inner_puzzle}")
             parent_coin = None
             for coin in removals:
@@ -355,8 +354,8 @@ class CCWallet:
                     parent_coin = coin
             if parent_coin is None:
                 raise ValueError("Error in finding parent")
-            lineage_proof = get_lineage_proof_from_coin_and_puz(parent_coin, puzzle)
-            await self.add_lineage(coin_name, lineage_proof)
+            # lineage_proof = get_lineage_proof_from_coin_and_puz(parent_coin, puzzle)
+            await self.add_lineage(coin_name, LineageProof(parent_coin.parent_coin_info, inner_puzzle.get_tree_hash(), parent_coin.amount))
             await self.wallet_state_manager.action_store.action_done(action_id)
 
     async def get_new_inner_hash(self) -> bytes32:
@@ -374,7 +373,7 @@ class CCWallet:
 
     def puzzle_for_pk(self, pubkey) -> Program:
         inner_puzzle = adapt_inner_to_singleton(self.standard_wallet.puzzle_for_pk(bytes(pubkey)))
-        cc_puzzle: Program = cc_puzzle_for_inner_puzzle(CC_MOD, self.cc_info.my_genesis_checker, inner_puzzle)
+        cc_puzzle: Program = construct_cc_puzzle(CC_MOD, self.cc_info.my_genesis_checker, inner_puzzle)
         self.base_puzzle_program = bytes(cc_puzzle)
         self.base_inner_puzzle_hash = inner_puzzle.get_tree_hash()
         return cc_puzzle
@@ -395,10 +394,10 @@ class CCWallet:
         origin = coins.copy().pop()
         origin_id = origin.name()
 
-        cc_inner = await self.get_new_inner_hash()
-        cc_puzzle_hash: Program = cc_puzzle_hash_for_inner_puzzle_hash(
+        cc_inner = await self.get_new_inner_puzzle()
+        cc_puzzle_hash: Program = construct_cc_puzzle(
             CC_MOD, self.cc_info.my_genesis_checker, cc_inner
-        )
+        ).get_tree_hash()
 
         tx: TransactionRecord = await self.standard_wallet.generate_signed_transaction(
             uint64(0), cc_puzzle_hash, uint64(0), origin_id, coins
@@ -410,11 +409,8 @@ class CCWallet:
         # generate eve coin so we can add future lineage_proofs even if we don't eve spend
         eve_coin = Coin(origin_id, cc_puzzle_hash, uint64(0))
 
-        await self.add_lineage(
-            eve_coin.name(),
-            Program.to([eve_coin.parent_coin_info, cc_inner, eve_coin.amount]),
-        )
-        await self.add_lineage(eve_coin.parent_coin_info, Program.to(origin.as_list()))
+        await self.add_lineage(eve_coin.name(), LineageProof(eve_coin.parent_coin_info, cc_inner.get_tree_hash(), eve_coin.amount))
+        await self.add_lineage(eve_coin.parent_coin_info, None)
 
         if send:
             regular_record = TransactionRecord(
@@ -496,9 +492,7 @@ class CCWallet:
         )
 
         for record in record_list:
-            lineage = await self.get_lineage_proof_for_coin(record.coin)
-            if lineage is not None:
-                result.append(record)
+            result.append(record)
 
         return result
 
@@ -643,11 +637,10 @@ class CCWallet:
                 innersol = self.standard_wallet.make_solution()
             innersol_list.append(innersol)
             lineage_proof = await self.get_lineage_proof_for_coin(coin)
-            assert lineage_proof is not None
-            spendable_cc_list.append(SpendableCC(coin, genesis_id, inner_puzzle, lineage_proof))
-            truths = Program.to(
-                [coin.name(), coin.puzzle_hash, inner_puzzle.get_tree_hash(), coin.amount, lineage_proof, cc_struct]
-            )
+            new_spendable_cc = SpendableCC(coin, genesis_id, inner_puzzle, lineage_proof)
+            spendable_cc_list.append(new_spendable_cc)
+            limitations_reveal = Program.to([]) if lineage_proof else self.cc_info.my_genesis_checker
+            truths = get_cat_truths(new_spendable_cc, limitations_reveal, Program.to([]))
             sigs = sigs + (await self.get_sigs(coin_inner_puzzle, truths.cons(innersol), coin.name()))
 
         spend_bundle = spend_bundle_for_spendable_ccs(
@@ -698,21 +691,20 @@ class CCWallet:
         origin = coins.copy().pop()
         origin_id = origin.name()
 
-        cc_inner_hash: bytes32 = await self.get_new_inner_hash()
-        await self.add_lineage(origin_id, Program.to(origin.as_list()))
+        cc_inner: Program = await self.get_new_inner_puzzle()
+        await self.add_lineage(origin_id, None)
         genesis_coin_checker: Program = create_genesis_or_zero_coin_checker(origin_id)
 
-        minted_cc_puzzle_hash: bytes32 = cc_puzzle_hash_for_inner_puzzle_hash(
-            CC_MOD, genesis_coin_checker, cc_inner_hash
-        )
+        minted_cc_puzzle_hash: bytes32 = construct_cc_puzzle(
+            CC_MOD, genesis_coin_checker, cc_inner
+        ).get_tree_hash()
 
         tx_record: TransactionRecord = await self.standard_wallet.generate_signed_transaction(
             amount, minted_cc_puzzle_hash, uint64(0), origin_id, coins
         )
         assert tx_record.spend_bundle is not None
 
-        lineage_proof: Optional[Program] = lineage_proof_for_genesis(origin)
-        lineage_proofs = [(origin_id, lineage_proof)]
+        lineage_proofs = [(origin_id, None)]
         cc_info: CCInfo = CCInfo(genesis_coin_checker, lineage_proofs)
         await self.save_info(cc_info, False)
         return tx_record.spend_bundle
@@ -751,7 +743,7 @@ class CCWallet:
             innerpuz: Program = await self.inner_puzzle_for_cc_puzhash(coin.puzzle_hash)
             sigs = sigs + await self.get_sigs(innerpuz, innersol, coin.name())
             lineage_proof = await self.get_lineage_proof_for_coin(coin)
-            puzzle_reveal = cc_puzzle_for_inner_puzzle(CC_MOD, self.cc_info.my_genesis_checker, innerpuz)
+            puzzle_reveal = construct_cc_puzzle(CC_MOD, self.cc_info.my_genesis_checker, innerpuz)
             # Use coin info to create solution and add coin and solution to list of CoinSpends
             solution = [
                 innersol,
