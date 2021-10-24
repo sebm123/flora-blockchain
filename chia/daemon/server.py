@@ -1293,7 +1293,7 @@ async def async_run_daemon(root_path: Path, wait_for_unlock: bool = False) -> in
     key_path = root_path / config["daemon_ssl"]["private_key"]
     ca_crt_path = root_path / config["private_ssl_ca"]["crt"]
     ca_key_path = root_path / config["private_ssl_ca"]["key"]
-    sys.stdout.flush()
+    sys._stdout_.flush()
     json_msg = dict_to_json_str(
         {
             "message": "cert_path",
@@ -1303,8 +1303,8 @@ async def async_run_daemon(root_path: Path, wait_for_unlock: bool = False) -> in
             "ca_crt": f"{ca_crt_path}",
         }
     )
-    sys.stdout.write("\n" + json_msg + "\n")
-    sys.stdout.flush()
+    sys._stdout_.write("\n" + json_msg + "\n")
+    sys._stdout_.flush()
     if lockfile is None:
         print("daemon: already launching")
         return 2
